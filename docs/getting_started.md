@@ -22,8 +22,8 @@ Shuffle is an open-source automation platform designed specifically for the secu
 - [Cloud Signup (SaaS)](https://shuffler.io/register)  
   Sign up for Shuffle's cloud-based service and get started quickly. Multi-Tenant [data-residency in a near you](https://shuffler.io/legal/privacy_policy#data-location).
 
-- [Hybrid Cloud](https://shuffler.io)  
-  Local automation runner (Orborus) connected to your Shuffle Cloud or Self-hosted setup.
+- [Hybrid Cloud](https://shuffler.io)
+  Run a local execution environment connected to Shuffle Cloud or a self-hosted backend. For Cloud Hybrid on Kubernetes, see the [setup guide](/docs/configuration#kubernetes-runtime).
 
 
 **Need help? Check out these resources:**

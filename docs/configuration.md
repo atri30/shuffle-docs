@@ -12,6 +12,8 @@ Documentation for configuring Shuffle. Most information is related to onprem and
 * [Production checklist](#production-checklist)
 * [Host & OpenSearch prerequisites (Linux)](#host--opensearch-prerequisites-linux)
 * [Environment Variables](#environment-variables)
+* [Hybrid Cloud Configuration](#hybrid-cloud-configuration)
+  * [Kubernetes runtime](#kubernetes-runtime)
 * [Shuffle Scaling](#scaling-shuffle)
 * [Distributed Caching](#distributed-caching)
 * [Kubernetes](#kubernetes)
@@ -281,6 +283,268 @@ The [default docker-compose file](https://github.com/shuffle/Shuffle/blob/main/d
 
 * Onprem: If you want to try using Hybrid Shuffle, see [Cloud sync documentation](/docs/tenants#cloud-synchronization)
 * Cloud: If you want access to on-premises resources and API's, [set up extra Environments](/docs/tenants#using-multiple-environments)
+
+#### Kubernetes runtime
+
+This setup connects a Kubernetes cluster to an existing Shuffle Cloud organization. Shuffle Cloud hosts the frontend, backend, and workflow data. Your cluster runs Orborus, a Worker, and the app containers that execute workflow actions. You do not need a local Shuffle backend, frontend, or OpenSearch for this mode.
+
+The Worker manages app images as well as app Deployments. When an image is missing from your private registry, it downloads the image archive from Shuffle Cloud, loads it into a Docker daemon in the Worker Pod, pushes it to the registry, verifies the pushed digest, and then deploys the app. Kubernetes nodes pull the app image from that registry. Users do not need to pull or load app images manually.
+
+> **Version requirement:** The Kubernetes Hybrid image-management changes require Shuffle `2.3.0` or newer (Helm chart and matching Orborus/Worker images). The examples below use the `2.3.0-rc1` chart and `nightly` images for pre-release testing; use a tested `2.3.0+` release or pinned image digests for long-lived installations.
+
+##### Before you start
+
+You need:
+
+- A Shuffle Cloud organization and a Hybrid execution environment. Copy its exact environment name, organization ID, regional Shuffle URL, and environment `AUTH` token from the Locations page. `AUTH` is not a user API key.
+- A Kubernetes cluster, `kubectl`, and Helm 3. The cluster must allow a privileged Worker sidecar.
+- A private container registry reachable by both the Worker Pod **for pushes** and every Kubernetes node **for pulls**. An authenticated TLS registry is recommended outside local testing.
+- Outbound access from Orborus and Worker to your Shuffle Cloud URL, plus access to the registries hosting the Orborus, Worker, and Docker sidecar images.
+- Enough node disk space for the Worker sidecar's temporary Docker image store and for app images on the nodes.
+
+Use a dedicated namespace such as `shuffle`. The chart and Worker create resources there. Keep the Worker's unauthenticated Docker API port inside the Pod/network boundary; the sidecar is privileged and its Docker API grants control over its Docker daemon.
+
+##### How image management works
+
+1. Orborus polls the selected Hybrid environment in Shuffle Cloud. The chart keeps a Worker Deployment running; Orborus does not create Workers in this configuration.
+2. The Worker starts an app action. If the app image is already present in the private registry, it can use that image.
+3. Otherwise the Worker downloads the archive from Shuffle Cloud's `/api/v1/get_docker_image` endpoint. The Pod-local `docker-image-manager` sidecar loads, tags, and pushes it to `shuffle.appRegistry`.
+4. The Worker verifies the pushed image digest before creating or refreshing the app Deployment. Kubernetes then pulls the image from the registry. An explicit image refresh from Shuffle Cloud forces a new download and restarts matching app Deployments.
+
+The private registry is the shared image store. The sidecar's `/var/lib/docker` uses temporary Pod storage; it is not a durable registry and can be lost when the Worker Pod restarts. Keep the registry available and retain its images for repeat executions. No separate image-manager service or Docker API endpoint on Orborus is required.
+
+##### Configure the cluster
+
+The following Helm values select the Cloud Hybrid runtime. Replace the placeholders and choose a registry address that both Worker and nodes can reach. `shuffle.appRegistry` is a host and optional port, without `http://` or `https://`.
+
+```yaml
+opensearch:
+  enabled: false
+
+backend:
+  replicaCount: 0
+
+frontend:
+  replicaCount: 0
+
+security:
+  enabled: false
+
+persistence:
+  enabled: false
+  appBuilder:
+    storageClass: standard
+
+shuffle:
+  hybrid: true
+  baseUrl: https://<your-regional-shuffle-url>
+  environmentName: <exact-hybrid-environment-name>
+  org: <organization-id>
+  appRegistry: <registry-host[:port]>
+  appRegistryInsecure: false
+
+orborus:
+  manageWorkerDeployments: false
+  image:
+    tag: nightly
+    pullPolicy: Always
+  extraEnvVarsSecret: shuffle-hybrid-credentials
+
+worker:
+  enableHelmDeployment: true
+  manageAppDeployments: true
+  image:
+    tag: nightly
+    pullPolicy: Always
+  imageManager:
+    enabled: true
+    storageSizeLimit: 20Gi
+
+app:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 768Mi
+```
+
+Save this as `shuffle-hybrid-values.yaml`. Select a valid `persistence.appBuilder.storageClass` for your cluster; the current chart creates the app-builder claim even when the local backend and general persistence are disabled. Set app resources for your workload: the chart's default `nano` preset limits memory to 192 MiB, which is insufficient for some Python apps.
+
+The image manager requires all of `shuffle.hybrid: true`, `worker.enableHelmDeployment: true`, `orborus.manageWorkerDeployments: false`, `worker.manageAppDeployments: true`, and a private `shuffle.appRegistry`. The chart rejects an incompatible combination.
+
+Create the environment credential Secret without putting the token in Helm values. Orborus reads `ORG` as well as `AUTH`; `shuffle.org` also configures the chart's `ORG_ID` and must match this value:
+
+```bash
+kubectl create namespace shuffle
+read -rsp 'Hybrid environment AUTH: ' SHUFFLE_HYBRID_AUTH; echo
+read -rp 'Shuffle organization ID: ' SHUFFLE_HYBRID_ORG
+kubectl -n shuffle create secret generic shuffle-hybrid-credentials \
+  --from-literal=AUTH="$SHUFFLE_HYBRID_AUTH" \
+  --from-literal=ORG="$SHUFFLE_HYBRID_ORG"
+unset SHUFFLE_HYBRID_AUTH SHUFFLE_HYBRID_ORG
+```
+
+For a registry that needs authentication, the Worker needs push credentials and app Pods need pull credentials. Create both Secrets in the `shuffle` namespace:
+
+```bash
+kubectl -n shuffle create secret generic shuffle-app-registry-credentials \
+  --from-literal=username='<registry-username>' \
+  --from-literal=password='<registry-password>'
+
+kubectl -n shuffle create secret docker-registry shuffle-app-registry-pull \
+  --docker-server='<registry-host[:port]>' \
+  --docker-username='<registry-username>' \
+  --docker-password='<registry-password>'
+```
+
+Merge these entries into the existing `worker` and `app` sections of `shuffle-hybrid-values.yaml`:
+
+```yaml
+worker:
+  imageManager:
+    registryAuthSecret: shuffle-app-registry-credentials
+
+app:
+  serviceAccount:
+    imagePullSecrets:
+      - shuffle-app-registry-pull
+```
+
+Use credentials that will remain valid across future app deployments. The Worker push Secret and Kubernetes pull Secret serve different clients; configuring only one will not work.
+
+Install or upgrade the release:
+
+```bash
+helm upgrade --install shuffle-orborus oci://ghcr.io/shuffle/charts/shuffle \
+  --version 2.3.0-rc1 \
+  --namespace shuffle \
+  --values shuffle-hybrid-values.yaml \
+  --wait --timeout 10m
+```
+
+##### Local example: Minikube registry
+
+Minikube's registry addon provides an unauthenticated HTTP registry suitable for a local test. Give Minikube's node runtime permission to pull from its service CIDR **when starting the cluster**:
+
+```bash
+minikube start \
+  --driver=docker \
+  --cpus=4 --memory=8192 --disk-size=40g \
+  --service-cluster-ip-range="10.96.0.0/12" \
+  --insecure-registry="10.96.0.0/12"
+
+minikube addons enable registry
+MINIKUBE_REGISTRY="$(kubectl -n kube-system get service registry -o jsonpath='{.spec.clusterIP}'):80"
+minikube ssh -- "curl -fsS http://${MINIKUBE_REGISTRY}/v2/"
+```
+
+The last command should return `{}`. Set `shuffle.appRegistry` to the displayed service IP and port, and `shuffle.appRegistryInsecure: true` in your values file. The latter configures the Worker's Docker sidecar; Minikube's `--insecure-registry` separately configures the node runtime that pulls app images. Use the same address in both places. For example:
+
+```bash
+helm upgrade --install shuffle-orborus oci://ghcr.io/shuffle/charts/shuffle \
+  --version 2.3.0-rc1 \
+  --namespace shuffle \
+  --values shuffle-hybrid-values.yaml \
+  --set-string shuffle.appRegistry="$MINIKUBE_REGISTRY" \
+  --set shuffle.appRegistryInsecure=true \
+  --wait --timeout 10m
+```
+
+The registry Service IP may change if the addon is recreated. For a shared or long-lived installation, use a stable TLS registry reachable by all nodes instead of the Minikube addon.
+
+##### Verify with a workflow
+
+First verify Orborus and the two Worker containers:
+
+```bash
+kubectl -n shuffle get deployments,pods,services,pvc
+kubectl -n shuffle rollout status deployment/shuffle-workers --timeout=5m
+kubectl -n shuffle logs deployment/shuffle-workers -c worker --tail=200
+kubectl -n shuffle logs deployment/shuffle-workers -c docker-image-manager --tail=100
+```
+
+Run a workflow in the exact Hybrid environment using an app that is not yet in your registry. Watch the Worker and app Pods:
+
+```bash
+kubectl -n shuffle logs deployment/shuffle-workers -c worker -f
+kubectl -n shuffle get pods -w
+```
+
+The Worker should log that it ensured the image and verified its digest. Check the app Pod's image, resolved digest, and pull policy:
+
+```bash
+kubectl -n shuffle get pods -l app.kubernetes.io/name=shuffle-app \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{range .status.containerStatuses[*]}{.image}{"  "}{.imageID}{"\n"}{end}{end}'
+```
+
+For the Minikube addon, you can also inspect its catalog:
+
+```bash
+MINIKUBE_REGISTRY="$(kubectl -n kube-system get service registry -o jsonpath='{.spec.clusterIP}'):80"
+minikube ssh -- "curl -fsS http://${MINIKUBE_REGISTRY}/v2/_catalog"
+```
+
+An app Pod with a registry image digest confirms the node could pull that image. To prove that this execution uploaded it, start with an empty registry or compare the registry contents before and after the run.
+
+##### Troubleshooting
+
+###### Execution stays queued
+
+Check that Orborus can reach `shuffle.baseUrl`, the Secret contains the environment `AUTH` token and matching `ORG`, and `shuffle.environmentName` matches the environment selected in the workflow. Inspect Orborus logs:
+
+```bash
+kubectl -n shuffle logs -l app.kubernetes.io/component=orborus --all-containers=true --tail=300
+```
+
+###### Worker is not ready
+
+The Worker Pod should have both `worker` and `docker-image-manager` ready. Inspect the Pod if the sidecar cannot start, lacks privileged access, or runs out of storage:
+
+```bash
+kubectl -n shuffle describe pod -l app.kubernetes.io/name=shuffle-worker
+kubectl -n shuffle logs deployment/shuffle-workers -c docker-image-manager --tail=300
+```
+
+###### Push fails with `http: server gave HTTP response to HTTPS client`
+
+For an HTTP registry, confirm both `shuffle.appRegistryInsecure: true` and the running Docker daemon's insecure registry list. Docker may log an initial HTTPS attempt before falling back to HTTP; the outcome is whether the Worker verifies the pushed digest. A Helm value alone does not prove the live sidecar has applied it.
+
+```bash
+kubectl -n shuffle exec deployment/shuffle-workers -c docker-image-manager -- \
+  docker info | sed -n '/Insecure Registries/,+8p'
+```
+
+For Minikube, the node runtime also needs the matching `--insecure-registry` setting. If the Worker verifies a digest but the app Pod has `ImagePullBackOff`, inspect its events and the node's access to the registry:
+
+```bash
+kubectl -n shuffle describe pod -l app.kubernetes.io/name=shuffle-app
+minikube ssh -- "curl -fsS http://${MINIKUBE_REGISTRY}/v2/"
+```
+
+###### Minikube registry addon has `ImagePullBackOff`
+
+Check the addon Pod events. If they report DNS errors for `registry-1.docker.io`, the Minikube node cannot resolve Docker Hub; this happens before Shuffle image management starts. Test DNS from the node and fix the host/Minikube DNS path before retrying:
+
+```bash
+kubectl -n kube-system describe pod -l actual-registry=true
+minikube ssh -- getent hosts registry-1.docker.io
+```
+
+###### App starts but reports a missing action or Python import
+
+If the Worker verified the registry digest and Kubernetes pulled the image, the distribution path worked. Check the app logs and the archive stored in Shuffle Cloud. An old or invalid cloud app image can still be distributed successfully; rebuild or re-upload that app, then request an image refresh. A newer public image with the same name does not repair a bad cloud archive automatically.
+
+###### App is OOM-killed
+
+Check its Pod events and raise `app.resources.limits.memory` if the app needs more than the configured limit:
+
+```bash
+kubectl -n shuffle describe pod -l app.kubernetes.io/name=shuffle-app
+```
+
+For self-hosted Shuffle with a local backend and OpenSearch, use the regular [Kubernetes configuration guide](/docs/configuration#kubernetes). This guide applies to a Cloud connected Hybrid execution environment.
 
 ### High Availability
 When running Shuffle on multiple servers, you need to take multiple things into account. Among them are:
@@ -748,6 +1012,8 @@ You need to change the value of the environment `BASE_URL` of this Dockerfile, s
 ### Kubernetes
 
 Shuffle on Kubernetes is possible thanks to our official Helm chart! This lets you run Shuffle across your cluster nodes with native pod management. For chart details and source templates, visit the [Shuffle Kubernetes repository](https://github.com/Shuffle/Shuffle/tree/main/functions/kubernetes).
+
+To run only Orborus, Worker, and apps in your cluster while keeping the backend in Shuffle Cloud, follow the [Hybrid Kubernetes runtime setup](#kubernetes-runtime). Its Worker image manager copies missing app images into your private registry automatically.
 
 #### Things to prepare for Kubernetes
 
@@ -2348,6 +2614,8 @@ As you will notice, app logs can be quite verbose (optional in a later build). I
 Please [notify me](https://twitter.com/frikkylikeme) if you need help debugging app executions ASAP, as I've done a lot of it, but it's more tricky than the other steps.
 
 ### Hybrid docker image handling
+
+This section describes older Docker-based Hybrid deployments. For Cloud Hybrid on Kubernetes, use the [Worker image manager setup](#kubernetes-runtime); it downloads, loads, and pushes app images automatically.
 
 We currently don't have a Docker Registry for Shuffle, meaning you need some minor configuration to get Orborus running remotely with the right containers. This only applies to containers not on dockerhub, as we automatically push PYTHON containers there when updated (not OpenAPI)
 

@@ -4,6 +4,7 @@
 > We've moved the contents of this onboarding guide into our main documentation so everything is easier to find:
 > - System design & how things work: [Architecture](/docs/architecture)
 > - Setup, requirements, `.env`, and Kubernetes: [Configuration](/docs/configuration)
+> - Cloud Hybrid execution on Kubernetes: [Hybrid Kubernetes setup](/docs/configuration#kubernetes-runtime)
 > - Debugging, common issues, and getting logs: [Troubleshooting](/docs/troubleshooting)
 > - Building your first workflow: [Getting Started](/docs/getting_started)
 

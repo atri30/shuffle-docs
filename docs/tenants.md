@@ -176,6 +176,8 @@ These parameters are specified exactly as a parameter within an action. The func
 ## Locations
 Locations, previously Environments, are a core part of Shuffle's open source build. **Cloud does not require any configuration for this**, unless you are connecting to your on-premises datacenter/cloud VPC. Think of a location as the place where Shuffle is allowed to run work: a server, Docker host, Docker Swarm cluster, Kubernetes cluster, datacenter, cloud VPC, or sensor group.
 
+For a Cloud Hybrid location running on Kubernetes, follow the [Hybrid Kubernetes setup](/docs/configuration#kubernetes-runtime), including its private app registry and Worker image manager configuration.
+
 Each location is matched by name. The name you configure in Shuffle must be the same value Orborus starts with in `ENVIRONMENT_NAME`. When an action or workflow is configured for that location, the backend queues the execution for that exact location name. Orborus polls that queue and starts workers only for matching executions.
 
 <img width="832" alt="image" src="https://github.com/user-attachments/assets/9ceaa766-9f1e-4c1d-b388-29fcb1f07ee5">
